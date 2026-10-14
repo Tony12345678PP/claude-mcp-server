@@ -1,5 +1,5 @@
 # claude-mcp-server
-
+自用
 Claude MCP Server for **Mind Library Sync** — 讓 AI 與你的編輯器共用同一個思維庫(vault):AI 可建立、調用、編輯、刪除、整理文件,並透過 Cloudflare Tunnel 在網頁端與桌面 client 皆可用。原生 Linux 與 **WSL** 皆可部署。
 
 ## 架構(Phase 1)
