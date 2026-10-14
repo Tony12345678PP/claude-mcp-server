@@ -1,6 +1,6 @@
 # claude-mcp-server
 
-Claude MCP Server for **Mind Library Sync** — 讓 AI 與你的編輯器共用同一個思維庫(vault):AI 可建立、調用、編輯、刪除、整理文件,並透過 Cloudflare Tunnel 在網頁端與桌面 client 皆可用。
+Claude MCP Server for **Mind Library Sync** — 讓 AI 與你的編輯器共用同一個思維庫(vault):AI 可建立、調用、編輯、刪除、整理文件,並透過 Cloudflare Tunnel 在網頁端與桌面 client 皆可用。原生 Linux 與 **WSL** 皆可部署。
 
 ## 架構(Phase 1)
 
@@ -26,9 +26,9 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 | `list_versions` | 檔案歷史版本 |
 | `restore_version` | 回滾到指定版本 |
 
-## 一鍵部署(最無腦版)
+## 一鍵部署(最無腦版,Linux / WSL 通用)
 
-在你要部署的 Linux 機器上:
+在你要部署的機器上(WSL 也一樣):
 
 ```bash
 git clone <this-repo>
@@ -44,10 +44,36 @@ sudo bash install.sh
 4. 問你 Cloudflare 的情況:
    - **有 token** → 螢幕上告訴你 token 在後台哪個位置,「在此貼上你的 tunnel token」
    - **沒有 tunnel** → 逐步教你開 [Zero Trust 後台](https://one.dash.cloudflare.com)、建立 tunnel、設定 hostname 指向 `localhost:3000`、複製 token 貼上
-   - **想晚點再設** → 選 3 跳過,之後重跑腳本即可補上
-5. 自動建置、產生金鑰、建立 systemd 服務(`mcp-vault` 只綁 **127.0.0.1:3000**,絕不直接對外;`cloudflared` 交給 Cloudflare 處理所有埠/HTTPS 的問題,兩個服務都 Restart=always)
+   - **想晚點再設** → 選 3 跳過,之後重跑腳本即可補上(token 會存起來,不用重貼)
+5. 自動建置、產生金鑰、建立服務(只綁 **127.0.0.1:3000**,絕不直接對外;`cloudflared` 交給 Cloudflare 處理所有埠/HTTPS 的問題)
 6. 自動跑驗證(health / OAuth metadata / 未授權請求 401)
 7. 最後問你「在此貼上你的公開網址」,寫入設定並重啟,然後**直接印出**你 client 要貼的 MCP 設定 JSON
+
+## 在 WSL 上部署
+
+腳本會自動偵測 WSL 並處理兩種狀況:
+
+**狀況 A — WSL 已啟用 systemd(新版 Windows 11 / WSL 2 預設):**
+與原生 Linux 完全相同,自動建 systemd 服務、開機自啟、故障自動重啟。
+
+**狀況 B — systemd 尚未啟用:**
+安裝腳本會問你要不要啟用:
+
+- 選 **1(建議)** → 腳本自動改好 `/etc/wsl.conf`,然後告訴你:
+  在 PowerShell 執行 `wsl --shutdown`,重開 WSL 視窗,再跑一次 `sudo bash install.sh`(進度保留,不會重裝)。之後就跟原生 Linux 一樣。
+- 選 **2** → 使用背景程序模式(nohup):照常安裝與啟動,並提供管理指令:
+  ```bash
+  sudo mcp-vault-ctl start    # 每次開機後執行一次
+  sudo mcp-vault-ctl status
+  sudo mcp-vault-ctl stop
+  tail -f /var/log/mcp-vault/server.log
+  ```
+  想全自動的話,在 Windows「工作排程器」加一筆開機工作執行:
+  `wsl -u root -- mcp-vault-ctl start`
+
+Cloudflare Tunnel 在 WSL 上完全沒問題:tunnel 是**向外**建立的連線,不需要開任何 inbound 埠。
+
+vault 若放在 `/mnt/c/...`(Windows 看得到)也可用,但存取效能比放在 Linux 檔案系統內慢。
 
 ## 連接 client
 
@@ -76,12 +102,12 @@ VAULT_DIR=/tmp/vault DATA_DIR=/tmp/vault-data JWT_SECRET=dev AUTH_PASSWORD=dev P
 
 ## 安全性須知
 
-- 這台常開機器就是可用性上限(重開機後 systemd 自動拉起;停機期間 client 會收到明確 401/離線錯誤)
+- 這台常開機器就是可用性上限(WSL 還多一層:Windows 本身要保持開機,且 WSL 服務要記得啟動)
 - OAuth 密碼頁是最低門檻;生產建議在 Cloudflare Access 再疊一層 email OTP,並開啟 Block AI bots 與 rate limiting
 - trash/versions 目錄尚無清理機制——空間會緩慢增長,屬 Phase 2 待辦
 - 雙向編輯器同步(編輯器擴充套件 + 推播)屬 Phase 2
 
 ## Roadmap
 
-- Phase 1(本 PR):Streamable HTTP MCP + 單人 OAuth + 沙箱化 CRUD + 軟刪除/版本歷史 + 互動式一鍵部署
+- Phase 1(本 PR):Streamable HTTP MCP + 單人 OAuth + 沙箱化 CRUD + 軟刪除/版本歷史 + 互動式一鍵部署(Linux / WSL)
 - Phase 2:編輯器擴充套件雙向同步、trash/versions 自動清理、Cloudflare Access 一鍵設定

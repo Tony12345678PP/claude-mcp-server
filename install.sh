@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Mind Library MCP Server — 無腦一鍵安裝嚮導
-#  用法:複製整個 repo 到機器上,然後執行:
+#  用法:複製整個 repo 到機器上(Linux 或 WSL 都可以),然後執行:
 #      sudo bash install.sh
 #  接下來所有步驟都會在畫面上一步步引導,不需要先讀任何文件。
 # ============================================================================
@@ -11,7 +11,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="/opt/mcp-vault"
 SERVICE_USER="mcp-vault"
 ENV_FILE="/etc/mcp-vault.env"
-SCRIPTS_URL_HINT="https://one.dash.cloudflare.com"
+CF_DASH="https://one.dash.cloudflare.com"
 
 # ---------- 樣式 ----------
 C_G="\033[1;32m"; C_Y="\033[1;33m"; C_B="\033[1;36m"; C_R="\033[1;31m"; C_0="\033[0m"
@@ -41,9 +41,63 @@ if [[ $EUID -ne 0 ]]; then
   exec sudo bash "$0" "$@"
 fi
 
+# ---------- 0.5 偵測環境:WSL?systemd? ----------
+IS_WSL=0
+if grep -qi microsoft /proc/version 2>/dev/null || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+  IS_WSL=1
+fi
+RUNTIME="systemd"
+if [[ $IS_WSL -eq 1 && ! -d /run/systemd/system ]]; then
+  step "偵測到 WSL,但 systemd 尚未啟用"
+  info "WSL 上有兩種執行方式,建議啟用 systemd(服務會自動重啟、開機自啟):"
+  info "  1) 幫我啟用 systemd → 腳本自動改好設定,你只需要重啟一次 WSL
+  2) 不要 systemd → 用背景程序模式(nohup),一切照常運作
+"
+  while true; do
+    ask "請輸入 1 / 2 [預設: 1]: "
+    read -r REPLY
+    REPLY="${REPLY:-1}"
+    if [[ "$REPLY" == "1" ]]; then
+      # 在 /etc/wsl.conf 啟用 systemd(保留既有內容)
+      touch /etc/wsl.conf
+      if ! grep -q '^\[boot\]' /etc/wsl.conf; then
+        printf '\n[boot]\nsystemd=true\n' >> /etc/wsl.conf
+      else
+        sed -i '/^\[boot\]/a systemd=true' /etc/wsl.conf
+      fi
+      printf '${C_Y}'
+      cat <<'EOF'
+  [!] 已在 /etc/wsl.conf 啟用 systemd。
+      現在請做這一件事(只需要一次):
+        1. 打開 Windows 的 PowerShell
+        2. 輸入:  wsl --shutdown
+        3. 等待 10 秒後,重新打開此 WSL 視窗
+        4. 重新執行:  sudo bash install.sh
+      (原本的進度都會保留,不會重裝)
+EOF
+      printf '${C_0}'
+      exit 0
+    elif [[ "$REPLY" == "2" ]]; then
+      RUNTIME="wsl-nosystemd"
+      warn "使用背景程序模式。服務不會在 Windows 重開機後自動啟動,"
+      warn "每次開機後需要執行一次:  sudo mcp-vault-ctl start"
+      break
+    else
+      warn "請輸入 1 或 2。"
+    fi
+  done
+elif [[ $IS_WSL -eq 1 ]]; then
+  log "偵測到 WSL,且 systemd 已啟用 — 一切照常,與原生 Linux 相同。"
+fi
+export RUNTIME
+
 # ---------- 1. Vault 位置 ----------
 step "步驟 1/6:思維庫(Vault)位置"
 info "這是 AI 可讀寫的資料夾,所有操作都被沙箱限制在此資料夾內。"
+if [[ $IS_WSL -eq 1 ]]; then
+  info "提示:想讓 Windows 端也看得到檔案,可放在 /mnt/c/... 之下,"
+  info "     但效能會比放在 Linux 檔案系統(如預設值)慢。"
+fi
 info "直接按 Enter 使用預設值 /srv/mind-vault;或貼上你自己的資料夾路徑。"
 VAULT_DIR="/srv/mind-vault"
 ask "Vault 資料夾 [預設: /srv/mind-vault]: "
@@ -94,7 +148,10 @@ fi
 
 # ---------- 4. Cloudflare Tunnel ----------
 step "步驟 4/6:Cloudflare Tunnel(解決埠/對外連線的問題)"
-info "你的機器不會開任何對外埠,流量經由 Cloudflare Tunnel 進來,一律走 HTTPS。"
+info "你的機器不會開任何對外埠,流量經由 Cloudflare Tunnel「主動向外連」的方式進來。"
+if [[ $IS_WSL -eq 1 ]]; then
+  info "這在 WSL 上完全沒問題:tunnel 是向外建立的連線,WSL 不需要任何 inbound 埠。"
+fi
 info "請選擇你的情況:"
 info "  1) 我已經有 tunnel token(貼上即可)
   2) 我有 Cloudflare 帳號,但還沒建立 tunnel → 教你在瀏覽器操作
@@ -108,7 +165,7 @@ while true; do
   case "$REPLY" in
     1)
       info "Tunnel token 會在 Cloudflare 後台這個位置:"
-      info "  $SCRIPTS_URL_HINT → 左側選「Networks」→「Tunnels」"
+      info "  $CF_DASH → 左側選「Networks」→「Tunnels」"
       info "  → 點你的 tunnel →「...」→ 可在頁面找到 token(一段很長的英數字)"
       ask "在此貼上你的 tunnel token: "
       read -r TUNNEL_TOKEN
@@ -130,7 +187,7 @@ done
 
 if [[ $TUNNEL_GUIDED -eq 1 ]]; then
   step "步驟 4:在瀏覽器建立 Tunnel(跟著做即可)"
-  info "打開瀏覽器,前往: $SCRIPTS_URL_HINT"
+  info "打開瀏覽器(Windows 上開即可),前往: $CF_DASH"
   info "
   1. 用你的 Cloudflare 帳號登入(沒有就免費註冊一個)
   2. 左側選單:「Networks」→「Tunnels」
@@ -152,7 +209,7 @@ fi
 # ---------- 5. 安裝本體 ----------
 step "步驟 5/6:安裝服務本體"
 id -u "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" /var/log/mcp-vault
 cp -r "$REPO_DIR/mcp-server/." "$INSTALL_DIR/"
 chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR" "$VAULT_DIR"
 info "安裝依賴並建置中(需要一兩分鐘)..."
@@ -160,6 +217,7 @@ sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && npm ci --loglevel=error &&
 log "建置完成。"
 
 JWT_SECRET="$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+if [[ ! -f "$ENV_FILE" ]]; then
 cat > "$ENV_FILE" <<EOF
 PORT=3000
 HOST=127.0.0.1
@@ -170,8 +228,28 @@ AUTH_PASSWORD=$AUTH_PASSWORD
 EOF
 chmod 600 "$ENV_FILE"
 log "已產生設定檔 $ENV_FILE(含隨機產生的 JWT 金鑰)。"
+else
+log "沿用已有的設定檔 $ENV_FILE。"
+fi
 
-cat > /etc/systemd/system/mcp-vault.service <<EOF
+if [[ -n "$TUNNEL_TOKEN" ]] && ! command -v cloudflared >/dev/null; then
+  info "下載 cloudflared..."
+  ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
+  chmod +x /usr/local/bin/cloudflared
+  log "cloudflared 安裝完成。"
+fi
+# 把 token 存進只有 root 可讀的檔案,重跑腳本不用再貼一次
+if [[ -n "$TUNNEL_TOKEN" ]]; then
+  printf '%s' "$TUNNEL_TOKEN" > /etc/mcp-vault.tunnel-token
+  chmod 600 /etc/mcp-vault.tunnel-token
+fi
+TUNNEL_TOKEN_FILE=""
+[[ -f /etc/mcp-vault.tunnel-token ]] && TUNNEL_TOKEN_FILE="/etc/mcp-vault.tunnel-token"
+
+# ---------- 5b. 依執行模式啟動服務 ----------
+if [[ "$RUNTIME" == "systemd" ]]; then
+  cat > /etc/systemd/system/mcp-vault.service <<EOF
 [Unit]
 Description=Mind Library MCP Server
 After=network-online.target
@@ -192,33 +270,74 @@ ReadWritePaths=$VAULT_DIR $INSTALL_DIR/data
 WantedBy=multi-user.target
 EOF
 
-if [[ -n "$TUNNEL_TOKEN" ]]; then
-  if ! command -v cloudflared >/dev/null; then
-    info "下載 cloudflared..."
-    ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
-    curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
-    chmod +x /usr/local/bin/cloudflared
-  fi
-  cat > /etc/systemd/system/cloudflared.service <<EOF
+  if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
+    cat > /etc/systemd/system/cloudflared.service <<EOF
 [Unit]
 Description=cloudflared tunnel for mind-library MCP
 After=network-online.target mcp-vault.service
 
 [Service]
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token $TUNNEL_TOKEN
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token $(cat $TUNNEL_TOKEN_FILE)
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now mcp-vault.service cloudflared.service >/dev/null 2>&1
-  log "已啟動服務:mcp-vault(127.0.0.1:3000)與 cloudflared(自動重啟)。"
+    systemctl daemon-reload
+    systemctl enable --now mcp-vault.service cloudflared.service >/dev/null 2>&1
+    log "已啟動服務:mcp-vault(127.0.0.1:3000)與 cloudflared(自動重啟)。"
+  else
+    systemctl daemon-reload
+    systemctl enable --now mcp-vault.service >/dev/null 2>&1
+    log "已啟動服務:mcp-vault(127.0.0.1:3000)。"
+  fi
 else
-  systemctl daemon-reload
-  systemctl enable --now mcp-vault.service >/dev/null 2>&1
-  log "已啟動服務:mcp-vault(127.0.0.1:3000)。"
+  # WSL 無 systemd:提供 ctl 腳本 + nohup 背景程序
+  cat > /usr/local/bin/mcp-vault-ctl <<EOF
+#!/usr/bin/env bash
+# WSL 模式服務管理:start / stop / restart / status
+set -u
+ENV_FILE="$ENV_FILE"
+INSTALL_DIR="$INSTALL_DIR"
+LOG_DIR="/var/log/mcp-vault"
+TOKEN_FILE="$TUNNEL_TOKEN_FILE"
+
+is_up()  { pgrep -f 'dist/index.js' >/dev/null; }
+cf_up()  { pgrep -f 'cloudflared tunnel' >/dev/null; }
+
+start() {
+  if is_up; then echo "[✓] mcp-vault 已在執行中"; else
+    set -a; . "$ENV_FILE"; set +a
+    nohup sudo -u mcp-vault env $(cat $ENV_FILE | xargs) node $INSTALL_DIR/dist/index.js >> $LOG_DIR/server.log 2>&1 &
+    sleep 1
+    is_up && echo "[✓] mcp-vault 已啟動(log: $LOG_DIR/server.log)" || { echo "[✗] 啟動失敗,看 log: tail -50 $LOG_DIR/server.log"; exit 1; }
+  fi
+  if [[ -n "$TOKEN_FILE" ]] && ! cf_up; then
+    nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$(cat $TOKEN_FILE)" >> $LOG_DIR/cloudflared.log 2>&1 &
+    sleep 2
+    cf_up && echo "[✓] cloudflared 已啟動(log: $LOG_DIR/cloudflared.log)" || echo "[!] cloudflared 似乎沒起來,看 log: tail -50 $LOG_DIR/cloudflared.log"
+  fi
+}
+stop() {
+  pkill -f 'dist/index.js' 2>/dev/null && echo "[✓] mcp-vault 已停止" || echo "[✓] mcp-vault 本來就沒在執行"
+  pkill -f 'cloudflared tunnel' 2>/dev/null && echo "[✓] cloudflared 已停止" || true
+}
+status() {
+  is_up && echo "[✓] mcp-vault 執行中" || echo "[✗] mcp-vault 未執行"
+  [[ -n "$TOKEN_FILE" ]] && { cf_up && echo "[✓] cloudflared 執行中" || echo "[✗] cloudflared 未執行"; }
+}
+case "${1:-}" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; sleep 1; start ;;
+  status|"" ) status ;;
+  *) echo "用法: mcp-vault-ctl start|stop|restart|status"; exit 1 ;;
+esac
+EOF
+  chmod +x /usr/local/bin/mcp-vault-ctl
+  /usr/local/bin/mcp-vault-ctl start
+  log "已用背景程序模式啟動。之後可用 mcp-vault-ctl start/stop/status 管理。"
 fi
 
 # ---------- 6. 驗證 ----------
@@ -228,17 +347,24 @@ bash "$REPO_DIR/scripts/verify.sh"
 # ---------- 收尾:問公開 URL ----------
 printf '\n'
 step "完成!最後一步:填入你的公開網址"
-if [[ -n "$TUNNEL_TOKEN" ]]; then
+if [[ -n "$TUNNEL_TOKEN_FILE" ]]; then
   info "你在 Cloudflare 後台為這個 tunnel 設定的公開網址就是 client 之後要連的位址,"
   info "例如:  https://mcp.yourdomain.com"
   ask "在此貼上你的公開網址(https://...): "
   read -r PUBLIC_URL
   if [[ -n "$PUBLIC_URL" ]]; then
+    sed -i '/^PUBLIC_URL=/d' "$ENV_FILE"
     echo "PUBLIC_URL=$PUBLIC_URL" >> "$ENV_FILE"
-    systemctl restart mcp-vault
+    if [[ "$RUNTIME" == "systemd" ]]; then
+      systemctl restart mcp-vault
+    else
+      pkill -f 'dist/index.js' 2>/dev/null || true
+      sleep 1
+      /usr/local/bin/mcp-vault-ctl start
+    fi
     log "已寫入並重啟服務。"
   else
-    warn "略過。之後編輯 $ENV_FILE 加上 PUBLIC_URL=<網址> 再 systemctl restart mcp-vault。"
+    warn "略過。之後編輯 $ENV_FILE 加上 PUBLIC_URL=<網址> 再重啟服務即可。"
   fi
 else
   warn "尚未設定 tunnel。之後重跑本腳本(sudo bash install.sh)即可補上。"
@@ -259,7 +385,22 @@ info '  {
 info ""
 info "第一次連線會跳出密碼頁,輸入你剛才設定的閘門密碼即可授權。"
 info ""
-info "常用指令:"
-info "  查看狀態:  systemctl status mcp-vault"
-info "  看即時log: journalctl -u mcp-vault -f"
+if [[ "$RUNTIME" == "systemd" ]]; then
+  info "常用指令:"
+  info "  查看狀態:  systemctl status mcp-vault"
+  info "  看即時log: journalctl -u mcp-vault -f"
+else
+  info "WSL 模式常用指令:"
+  info "  查看狀態:  sudo mcp-vault-ctl status"
+  info "  啟動/停止: sudo mcp-vault-ctl start / stop"
+  info "  看log:     tail -f /var/log/mcp-vault/server.log"
+  if [[ $IS_WSL -eq 1 ]]; then
+    info ""
+    warn "注意:WSL 在 Windows 關機/重開機後不會自動啟動服務。"
+    info "每次開機後到 WSL 裡執行一次:"
+    info "  sudo mcp-vault-ctl start"
+    info "若想全自動,可在 Windows 工作排程器加一筆開機工作執行:"
+    info "  wsl -u root -- mcp-vault-ctl start"
+  fi
+fi
 printf '\n'
