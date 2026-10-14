@@ -308,8 +308,8 @@ cf_up()  { pgrep -f 'cloudflared tunnel' >/dev/null; }
 
 start() {
   if is_up; then echo "[✓] mcp-vault 已在執行中"; else
-    set -a; . "$ENV_FILE"; set +a
-    nohup sudo -u mcp-vault env $(cat $ENV_FILE | xargs) node $INSTALL_DIR/dist/index.js >> $LOG_DIR/server.log 2>&1 &
+    mapfile -t ENV_KV < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE")
+    nohup sudo -u mcp-vault env "${ENV_KV[@]}" node $INSTALL_DIR/dist/index.js >> $LOG_DIR/server.log 2>&1 &
     sleep 1
     is_up && echo "[✓] mcp-vault 已啟動(log: $LOG_DIR/server.log)" || { echo "[✗] 啟動失敗,看 log: tail -50 $LOG_DIR/server.log"; exit 1; }
   fi

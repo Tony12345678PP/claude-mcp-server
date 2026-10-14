@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import path from 'node:path';
 import express from 'express';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -15,14 +16,45 @@ if (!VAULT_DIR) {
   process.exit(1);
 }
 
+fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const acquireLock = (lockFile: string): void => {
+  for (;;) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      process.on('exit', () => fs.rmSync(lockFile, { force: true }));
+      for (const sig of ['SIGINT', 'SIGTERM'] as const) process.once(sig, () => process.exit(0));
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      const owner = Number(fs.readFileSync(lockFile, 'utf8'));
+      try {
+        process.kill(owner, 0);
+      } catch {
+        fs.rmSync(lockFile, { force: true });
+        continue;
+      }
+      console.error(`FATAL: another server (pid ${owner}) already uses ${DATA_DIR}. Two processes would bypass the write lock.`);
+      process.exit(1);
+    }
+  }
+};
+
+acquireLock(path.join(DATA_DIR, 'server.lock'));
+
 const vault = new Vault(VAULT_DIR, DATA_DIR);
 
-const newServer = (): McpServer => {
+const actorOf = (req: express.Request): string => {
+  const who = req.header('cf-access-authenticated-user-email') ?? req.header('user-agent') ?? 'unknown-client';
+  return who.replace(/[<>\r\n]/g, '').slice(0, 120) || 'unknown-client';
+};
+
+const newServer = (actor: string): McpServer => {
   const server = new McpServer(
     { name: 'mind-library-mcp', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
-  registerVaultTools(server, vault);
+  registerVaultTools(server, vault, actor);
   return server;
 };
 
@@ -35,7 +67,7 @@ app.use('/', authRouter);
 const handleMcp = async (req: express.Request, res: express.Response) => {
   // Stateless mode: one server + transport per request
   try {
-    const server = newServer();
+    const server = newServer(actorOf(req));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { void transport.close(); void server.close(); });
     await server.connect(transport);
