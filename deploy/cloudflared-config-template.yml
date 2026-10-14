@@ -1,0 +1,19 @@
+# Template for a named Cloudflare tunnel (recommended over quick tunnels).
+#
+# 1. Create the tunnel and get a token:
+#      cloudflared tunnel login
+#      cloudflared tunnel create mind-library
+#      # (or create it in Zero Trust > Networks > Tunnnels and copy the token)
+#
+# 2. Point its public hostname at http://localhost:3000 in the Cloudflare dashboard.
+#
+# 3. Run the installer with the token:
+#      sudo TUNNEL_TOKEN=<paste-token> ./install.sh /srv/mind-vault
+#
+# Alternative (no account, testing only - URL changes on every restart):
+#      cloudflared tunnel --url http://localhost:3000
+#
+# Recommended extra hardening:
+#   - Put the tunnel hostname behind Cloudflare Access (email OTP policy),
+#     so even a leaked vault password cannot reach the server alone.
+#   - Enable "Block AI bots" and rate limiting for the hostname in Zero Trust.
