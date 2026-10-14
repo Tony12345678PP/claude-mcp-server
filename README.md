@@ -26,47 +26,45 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 | `list_versions` | 檔案歷史版本 |
 | `restore_version` | 回滾到指定版本 |
 
-## 一鍵部署(Linux + systemd)
+## 一鍵部署(最無腦版)
+
+在你要部署的 Linux 機器上:
 
 ```bash
-git clone <this-repo> && cd claude-mcp-server
-sudo TUNNEL_TOKEN=<cloudflare-tunnel-token> ./install.sh /srv/mind-vault
+git clone <this-repo>
+cd claude-mcp-server
+sudo bash install.sh
 ```
 
-安裝腳本會:
+就這樣。接下來**全部在畫面上互動完成**,不需要先讀任何文件:
 
-1. 安裝/檢查 Node.js 20+
-2. 建立 `mcp-vault` 系統使用者與服務目錄 `/opt/mcp-vault`
-3. 安裝依賴並建置 TypeScript
-4. 產生 `/etc/mcp-vault.env`(隨機 JWT_SECRET、你設定的閘門密碼)
-5. 安裝並啟用 systemd 服務:`mcp-vault`(綁定 **127.0.0.1:3000**,絕不直接對外)與 `cloudflared`(自動重啟)
-6. 執行 `scripts/verify.sh` 驗證:health、OAuth metadata、未授權請求回 401
-
-沒有 tunnel token 也能裝(先起 server,之後補 cloudflared;測試可參照 [deploy/cloudflared-config-template.yml](deploy/cloudflared-config-template.yml))。
-
-## Cloudflare 端設定
-
-1. 在 Zero Trust 建立 named tunnel,public hostname 指向 `http://localhost:3000`
-2. 取得 token 後帶入安裝腳本(或之後啟用 `cloudflared.service`)
-3. **將最終公開 URL 寫入 `/etc/mcp-vault.env` 的 `PUBLIC_URL`**(OAuth metadata 依此簽發),然後 `systemctl restart mcp-vault`
-4. 建議:在 tunnel hostname 前再加一層 Cloudflare Access(email OTP),並開啟 Block AI bots 與 rate limiting
+1. 問你思維庫要放哪(直接 Enter 用預設)
+2. 要你設定閘門密碼(輸入兩次,不顯示)
+3. 自動裝 Node.js 20(已有則跳過)
+4. 問你 Cloudflare 的情況:
+   - **有 token** → 螢幕上告訴你 token 在後台哪個位置,「在此貼上你的 tunnel token」
+   - **沒有 tunnel** → 逐步教你開 [Zero Trust 後台](https://one.dash.cloudflare.com)、建立 tunnel、設定 hostname 指向 `localhost:3000`、複製 token 貼上
+   - **想晚點再設** → 選 3 跳過,之後重跑腳本即可補上
+5. 自動建置、產生金鑰、建立 systemd 服務(`mcp-vault` 只綁 **127.0.0.1:3000**,絕不直接對外;`cloudflared` 交給 Cloudflare 處理所有埠/HTTPS 的問題,兩個服務都 Restart=always)
+6. 自動跑驗證(health / OAuth metadata / 未授權請求 401)
+7. 最後問你「在此貼上你的公開網址」,寫入設定並重啟,然後**直接印出**你 client 要貼的 MCP 設定 JSON
 
 ## 連接 client
 
-Client 的 MCP 設定(Streamable HTTP):
+安裝結束時畫面會直接印出你的設定,長這樣(Streamable HTTP):
 
 ```json
 {
   "mcpServers": {
     "mind-library": {
       "type": "http",
-      "url": "https://<your-tunnel-host>/mcp"
+      "url": "https://<你的網域>/mcp"
     }
   }
 }
 ```
 
-第一次連線會導向 `/authorize` 密碼頁,授權後 client 以 bearer JWT 呼叫工具。
+第一次連線會導向 `/authorize` 密碼頁,輸入你安裝時設定的閘門密碼即可。
 
 ## 手動開發執行
 
@@ -79,11 +77,11 @@ VAULT_DIR=/tmp/vault DATA_DIR=/tmp/vault-data JWT_SECRET=dev AUTH_PASSWORD=dev P
 ## 安全性須知
 
 - 這台常開機器就是可用性上限(重開機後 systemd 自動拉起;停機期間 client 會收到明確 401/離線錯誤)
-- OAuth 密碼頁是最低門檻;生產建議疊加 Cloudflare Access
+- OAuth 密碼頁是最低門檻;生產建議在 Cloudflare Access 再疊一層 email OTP,並開啟 Block AI bots 與 rate limiting
 - trash/versions 目錄尚無清理機制——空間會緩慢增長,屬 Phase 2 待辦
 - 雙向編輯器同步(編輯器擴充套件 + 推播)屬 Phase 2
 
 ## Roadmap
 
-- Phase 1(本 PR):Streamable HTTP MCP + 單人 OAuth + 沙箱化 CRUD + 軟刪除/版本歷史 + 一鍵部署
+- Phase 1(本 PR):Streamable HTTP MCP + 單人 OAuth + 沙箱化 CRUD + 軟刪除/版本歷史 + 互動式一鍵部署
 - Phase 2:編輯器擴充套件雙向同步、trash/versions 自動清理、Cloudflare Access 一鍵設定
