@@ -31,7 +31,7 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 在你要部署的機器上(WSL 也一樣):
 
 ```bash
-git clone https://github.com/Tony12345678PP/claude-mcp-server.git
+gh repo clone Tony12345678PP/claude-mcp-server
 cd claude-mcp-server
 sudo bash install.sh
 ```
