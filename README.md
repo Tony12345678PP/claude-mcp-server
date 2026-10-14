@@ -9,7 +9,7 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 ```
 
 - **Transport**: Streamable HTTP(無狀態模式),瀏覽器與桌面 client 皆可用
-- **認證**: 兩層。(1) 設定 `ACCESS_TEAM_DOMAIN` 與 `ACCESS_AUD` 後，每個 `/mcp` 請求都必須帶 Cloudflare Access 的 `Cf-Access-Jwt-Assertion`，以 JWKS 驗證簽章、issuer、audience，commit 作者取自驗證後的 email。(2) 內建單人 OAuth 2.0：密碼閘門頁(`/authorize`)→ 授權碼（單次使用）→ 自簽 HS256 JWT(15 分鐘)+ refresh token 單次輪替（保留原 client 的 subject）
+- **認證**: 兩層。(1) 設定 `ACCESS_TEAM_DOMAIN` 與 `ACCESS_AUD` 後，每個 `/mcp` 請求都必須帶 Cloudflare Access 的 `Cf-Access-Jwt-Assertion`，以 JWKS 驗證簽章、issuer、audience，commit 作者取自驗證後的 email。(2) 內建單人 OAuth 2.0：動態註冊（`/register`，僅接受 claude.ai 與 localhost 回呼）→ PKCE S256 → 密碼閘門頁(`/authorize`)→ 授權碼（單次使用，綁定 client 與 redirect_uri）→ 自簽 HS256 JWT(15 分鐘)+ refresh token 單次輪替（保留原 client 的 subject）
 - **路徑沙箱**: 所有工具操作被限制在 `VAULT_DIR` 內,realpath 驗證擋掉 symlink 逃逸與 `..` 穿越
 - **衝突防護**: `read_file` 回傳 revision(內容雜湊)。覆寫既有檔案必須帶 `expected_revision`，否則被拒絕；所有寫入經同一把鎖序列化，同一 revision 的並發寫入只有一個成功
 - **版本歷史(git)**: 每次寫入/刪除都是 `DATA_DIR/shadow.git` 裡的一筆 commit，只提交被改的那個檔案。第一次覆寫既有檔案前會先記錄原內容（baseline）。`delete_file` 之後可用 `restore_version` 還原
@@ -42,7 +42,7 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
    ```
 7. **claude.ai connector**：Settings → Connectors → Add custom connector，URL 填 `https://mcp.<你的網域>/mcp`。
 
-> **尚未驗證**：Access 能否作為 claude.ai connector 的 OAuth 授權端（Managed OAuth 與 Dynamic Client Registration）。若第 7 步無法完成授權，請回報結果，接著會改用內建 OAuth 作為主要認證。Access 的 JWT issuer 格式也需以第一次實際請求的 token 確認。
+> **尚未驗證**：Access 能否作為 claude.ai connector 的 OAuth 授權端（Managed OAuth 與 Dynamic Client Registration）。若第 7 步無法完成授權，請回報結果；內建 OAuth 已支援動態註冊與 PKCE，可作為替代，但尚未用 claude.ai 實測。Access 的 JWT issuer 格式也需以第一次實際請求的 token 確認。
 
 ## 版本歷史與你自己的 git
 
