@@ -146,6 +146,18 @@ else
   log "Node.js $(node -v) 安裝完成。"
 fi
 
+if ! command -v git >/dev/null; then
+  info "正在安裝 git..."
+  if command -v apt-get >/dev/null; then
+    apt-get update -y && apt-get install -y git
+  elif command -v dnf >/dev/null; then
+    dnf install -y git
+  else
+    fail "找不到 git,請手動安裝後重新執行本腳本。"
+  fi
+fi
+log "git $(git --version | awk '{print $3}') 已就緒。"
+
 # ---------- 4. Cloudflare Tunnel ----------
 step "步驟 4/6:Cloudflare Tunnel(解決埠/對外連線的問題)"
 info "你的機器不會開任何對外埠,流量經由 Cloudflare Tunnel「主動向外連」的方式進來。"

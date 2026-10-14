@@ -28,7 +28,7 @@ if (!PASSWORD || !process.env.JWT_SECRET) {
 
 const sha256hex = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
 
-type RefreshRecord = { hash: string; created: number };
+type RefreshRecord = { hash: string; created: number; sub: string };
 const loadRefresh = (): RefreshRecord[] => {
   try { return JSON.parse(fs.readFileSync(REFRESH_FILE, 'utf8')); } catch { return []; }
 };
@@ -47,13 +47,22 @@ const issueTokens = async (sub: string) => {
     .sign(SECRET);
   const refresh = crypto.randomBytes(48).toString('hex');
   const list = loadRefresh();
-  list.push({ hash: sha256hex(refresh), created: Date.now() });
+  list.push({ hash: sha256hex(refresh), created: Date.now(), sub });
   saveRefresh(list);
   return { access_token: access, token_type: 'Bearer', expires_in: ACCESS_TTL, refresh_token: refresh };
 };
 
 // --- in-memory authorization codes (10 min TTL, single use) ---
-const codes = new Map<string, { sub: string; used: boolean; expires: number }>();
+const codes = new Map<string, { sub: string; expires: number }>();
+const pruneCodes = () => {
+  const now = Date.now();
+  for (const [code, rec] of codes) if (rec.expires < now) codes.delete(code);
+};
+const ALLOWED_REDIRECTS = [
+  /^https:\/\/claude\.ai\/(api\/mcp\/auth_callback|oauth\/callback)$/,
+  /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?\//,
+];
+const isAllowedRedirect = (u: string) => ALLOWED_REDIRECTS.some(re => re.test(u));
 
 const metadata = {
   issuer: BASE_URL,
@@ -90,18 +99,19 @@ authRouter.get('/.well-known/oauth-protected-resource', (_req, res) =>
 
 authRouter.get('/authorize', (req, res) => {
   const q = new URLSearchParams(req.query as Record<string, string>);
-  if (!q.get('redirect_uri')) return res.status(400).send('redirect_uri is required');
+  if (!isAllowedRedirect(q.get('redirect_uri') ?? '')) return res.status(400).send('redirect_uri not allowed');
   res.type('html').send(passwordPage(q));
 });
 
 authRouter.post('/authorize', express.urlencoded({ extended: false }), (req, res) => {
   const { password, redirect_uri, state, client_id } = req.body as Record<string, string>;
-  if (!redirect_uri) return res.status(400).send('redirect_uri is required');
+  if (!isAllowedRedirect(redirect_uri ?? '')) return res.status(400).send('redirect_uri not allowed');
   if (password !== PASSWORD) {
     return res.status(401).type('html').send(passwordPage(new URLSearchParams({ redirect_uri, state: state ?? '' })));
   }
+  pruneCodes();
   const code = crypto.randomBytes(24).toString('hex');
-  codes.set(code, { sub: client_id ?? 'claude-client', used: false, expires: Date.now() + 10 * 60 * 1000 });
+  codes.set(code, { sub: client_id ?? 'claude-client', expires: Date.now() + 10 * 60 * 1000 });
   const u = new URL(redirect_uri);
   u.searchParams.set('code', code);
   if (state) u.searchParams.set('state', state);
@@ -113,8 +123,8 @@ authRouter.post('/token', express.urlencoded({ extended: false }), async (req, r
   try {
     if (b.grant_type === 'authorization_code') {
       const rec = codes.get(b.code ?? '');
-      if (!rec || rec.used || rec.expires < Date.now()) return res.status(400).json({ error: 'invalid_grant' });
-      rec.used = true;
+      codes.delete(b.code ?? '');
+      if (!rec || rec.expires < Date.now()) return res.status(400).json({ error: 'invalid_grant' });
       return res.json(await issueTokens(rec.sub));
     }
     if (b.grant_type === 'refresh_token') {
@@ -122,9 +132,9 @@ authRouter.post('/token', express.urlencoded({ extended: false }), async (req, r
       const hash = sha256hex(b.refresh_token ?? '');
       const idx = list.findIndex(r => r.hash === hash);
       if (idx === -1) return res.status(400).json({ error: 'invalid_grant' });
-      list.splice(idx, 1); // rotation: single use
+      const [old] = list.splice(idx, 1); // rotation: single use
       saveRefresh(list);
-      return res.json(await issueTokens('claude-client'));
+      return res.json(await issueTokens(old.sub));
     }
     return res.status(400).json({ error: 'unsupported_grant_type' });
   } catch (e) {

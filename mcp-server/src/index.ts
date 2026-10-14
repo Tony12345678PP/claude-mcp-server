@@ -5,6 +5,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { registerVaultTools, Vault } from './vault.js';
 import { authRouter, requireAuth } from './auth.js';
+import { accessConfigFromEnv, requireAccess } from './access.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '127.0.0.1'; // never expose directly; cloudflared is the gatekeeper
@@ -16,6 +17,10 @@ if (!VAULT_DIR) {
   process.exit(1);
 }
 
+if (path.resolve(DATA_DIR).startsWith(path.resolve(VAULT_DIR) + path.sep)) {
+  console.error('FATAL: DATA_DIR must not be inside VAULT_DIR.');
+  process.exit(1);
+}
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const acquireLock = (lockFile: string): void => {
@@ -44,8 +49,11 @@ acquireLock(path.join(DATA_DIR, 'server.lock'));
 
 const vault = new Vault(VAULT_DIR, DATA_DIR);
 
-const actorOf = (req: express.Request): string => {
-  const who = req.header('cf-access-authenticated-user-email') ?? req.header('user-agent') ?? 'unknown-client';
+const accessCfg = accessConfigFromEnv(process.env);
+const mcpGates: express.RequestHandler[] = [...(accessCfg ? [requireAccess(accessCfg)] : []), requireAuth];
+
+const actorOf = (req: express.Request, res: express.Response): string => {
+  const who = (res.locals.actor as string | undefined) ?? req.header('user-agent') ?? 'unknown-client';
   return who.replace(/[<>\r\n]/g, '').slice(0, 120) || 'unknown-client';
 };
 
@@ -67,7 +75,7 @@ app.use('/', authRouter);
 const handleMcp = async (req: express.Request, res: express.Response) => {
   // Stateless mode: one server + transport per request
   try {
-    const server = newServer(actorOf(req));
+    const server = newServer(actorOf(req, res));
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { void transport.close(); void server.close(); });
     await server.connect(transport);
@@ -78,12 +86,16 @@ const handleMcp = async (req: express.Request, res: express.Response) => {
   }
 };
 
-app.post('/mcp', requireAuth, handleMcp);
-app.get('/mcp', requireAuth, (_req, res) => res.status(405).json({ error: 'Method not allowed (stateless server)' }));
-app.delete('/mcp', requireAuth, (_req, res) => res.status(405).json({ error: 'Method not allowed (stateless server)' }));
+app.post('/mcp', mcpGates, handleMcp);
+const methodNotAllowed = (_req: express.Request, res: express.Response) => res.status(405).json({ error: 'Method not allowed (stateless server)' });
+app.get('/mcp', mcpGates, methodNotAllowed);
+app.delete('/mcp', mcpGates, methodNotAllowed);
 
 app.listen(PORT, HOST, () => {
   console.log(`mind-library-mcp listening on http://${HOST}:${PORT}`);
   console.log(`  vault:  ${VAULT_DIR}`);
   console.log(`  public: ${process.env.PUBLIC_URL ?? 'not set (set PUBLIC_URL to the tunnel URL)'}`);
+  console.log(accessCfg
+    ? `  access: enforced (issuer ${accessCfg.issuer}, aud ${accessCfg.audience})`
+    : '  access: NOT enforced (set ACCESS_TEAM_DOMAIN and ACCESS_AUD)');
 });
