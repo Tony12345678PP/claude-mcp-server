@@ -9,11 +9,11 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 ```
 
 - **Transport**: Streamable HTTP(無狀態模式),瀏覽器與桌面 client 皆可用
-- **認證**: 單人簡化版 OAuth 2.0 — 密碼閘門頁(`/authorize`)→ 授權碼 → 自簽 HS256 JWT(15 分鐘)+ refresh token 單次輪替、雜湊落盤
+- **認證**: 兩層。(1) 設定 `ACCESS_TEAM_DOMAIN` 與 `ACCESS_AUD` 後，每個 `/mcp` 請求都必須帶 Cloudflare Access 的 `Cf-Access-Jwt-Assertion`，以 JWKS 驗證簽章、issuer、audience，commit 作者取自驗證後的 email。(2) 內建單人 OAuth 2.0：動態註冊（`/register`，僅接受 claude.ai 與 localhost 回呼）→ PKCE S256 → 密碼閘門頁(`/authorize`)→ 授權碼（單次使用，綁定 client 與 redirect_uri）→ 自簽 HS256 JWT(15 分鐘)+ refresh token 單次輪替（保留原 client 的 subject）
 - **路徑沙箱**: 所有工具操作被限制在 `VAULT_DIR` 內,realpath 驗證擋掉 symlink 逃逸與 `..` 穿越
-- **衝突防護**: `read_file` 回傳 revision(內容雜湊),`write_file` 可帶 `expected_revision`,衝突時明確失敗而非覆蓋
-- **軟刪除 + 版本歷史**: 每次寫入/刪除前快照舊內容,`delete_file` 可恢復,`list_versions` / `restore_version` 隨時回滾
-- **審計**: 所有變更寫入 JSONL audit log
+- **衝突防護**: `read_file` 回傳 revision(內容雜湊)。覆寫既有檔案必須帶 `expected_revision`，否則被拒絕；所有寫入經同一把鎖序列化，同一 revision 的並發寫入只有一個成功
+- **版本歷史(git)**: 每次寫入/刪除都是 `DATA_DIR/shadow.git` 裡的一筆 commit，只提交被改的那個檔案。第一次覆寫既有檔案前會先記錄原內容（baseline）。`delete_file` 之後可用 `restore_version` 還原
+- **審計**: git log 即審計紀錄。作者為驗證後的 Access email（有設定 Access 時）或 User-Agent（未設定時，為自稱，不可信）
 
 ## MCP 工具
 
@@ -21,10 +21,36 @@ Claude / Web client ──HTTPS──> Cloudflare Tunnel ──> cloudflared ─
 |---|---|
 | `list_files` | 列出思維庫內檔案 |
 | `read_file` | 讀取檔案 + revision |
-| `write_file` | 建立/覆寫(帶 revision 衝突檢查)|
-| `delete_file` | 軟刪除(快照後進 trash)|
-| `list_versions` | 檔案歷史版本 |
-| `restore_version` | 回滾到指定版本 |
+| `write_file` | 建立；覆寫既有檔案必須帶 `expected_revision` |
+| `delete_file` | 刪除（可用 `restore_version` 還原）|
+| `list_versions` | 檔案變更歷史（git commit，新到舊）|
+| `restore_version` | 以指定 commit 的內容覆寫檔案（需 `expected_revision`）|
+
+## 前置條件（開始前先準備）
+
+安裝腳本會自動處理 Node.js、git、cloudflared。下列項目需要你在網頁後台自己完成，腳本無法代勞：
+
+1. **機器**：Linux 或 WSL，可 sudo，常開機，可對外連 443。
+2. **網域**：已在 Cloudflare DNS（已完成）。
+3. **Zero Trust 團隊**：到 <https://one.dash.cloudflare.com> 建立團隊（免費方案），記下 `<team>.cloudflareaccess.com`。
+4. **Tunnel**：Networks → Tunnels → Create，複製 token（安裝時貼上）。Public hostname 設為 `mcp.<你的網域>`，Service 為 `http://localhost:3000`。
+5. **Access 應用程式**：Access → Applications → Add → Self-hosted，Domain 填 `mcp.<你的網域>`。Policy 設為 Allow，Include → Emails → 你自己的 email。記下 **Application Audience (AUD) tag**。
+6. **寫入 Access 設定**：在環境檔（`/etc/mcp-vault.env`）加入下列兩行，然後重啟服務（`sudo systemctl restart mcp-vault`，或 nohup 模式用 `sudo mcp-vault-ctl stop && sudo mcp-vault-ctl start`）。啟動 log 應顯示 `access: enforced`。
+   ```
+   ACCESS_TEAM_DOMAIN=<team>.cloudflareaccess.com
+   ACCESS_AUD=<AUD tag>
+   ```
+7. **claude.ai connector**：Settings → Connectors → Add custom connector，URL 填 `https://mcp.<你的網域>/mcp`。
+
+> **尚未驗證**：Access 能否作為 claude.ai connector 的 OAuth 授權端（Managed OAuth 與 Dynamic Client Registration）。若第 7 步無法完成授權，請回報結果；內建 OAuth 已支援動態註冊與 PKCE，可作為替代，但尚未用 claude.ai 實測。Access 的 JWT issuer 格式也需以第一次實際請求的 token 確認。
+
+## 版本歷史與你自己的 git
+
+`VAULT_DIR` 可以直接是你的程式碼 repo。MCP 的寫入記在 `DATA_DIR/shadow.git`，不會進你的 `.git`，也不會出現在你的 `git status` 或 commit 裡。查看 Claude 改過的紀錄：
+
+```bash
+git --git-dir=<DATA_DIR>/shadow.git --work-tree=<VAULT_DIR> log --oneline -- <path>
+```
 
 ## 一鍵部署(最無腦版,Linux / WSL 通用)
 
@@ -103,11 +129,11 @@ VAULT_DIR=/tmp/vault DATA_DIR=/tmp/vault-data JWT_SECRET=dev AUTH_PASSWORD=dev P
 ## 安全性須知
 
 - 這台常開機器就是可用性上限(WSL 還多一層:Windows 本身要保持開機,且 WSL 服務要記得啟動)
-- OAuth 密碼頁是最低門檻;生產建議在 Cloudflare Access 再疊一層 email OTP,並開啟 Block AI bots 與 rate limiting
-- trash/versions 目錄尚無清理機制——空間會緩慢增長,屬 Phase 2 待辦
+- 未設定 Access 時，任何能通過密碼閘門的人都能寫入 vault。強烈建議完成上方的 Access 設定，並在 Cloudflare 開啟 Block AI bots 與 rate limiting（含 `/authorize`）
+- `shadow.git` 會隨寫入持續增長，目前沒有 gc 機制（待辦）
 - 雙向編輯器同步(編輯器擴充套件 + 推播)屬 Phase 2
 
 ## Roadmap
 
-- Phase 1(本 PR):Streamable HTTP MCP + 單人 OAuth + 沙箱化 CRUD + 軟刪除/版本歷史 + 互動式一鍵部署(Linux / WSL)
-- Phase 2:編輯器擴充套件雙向同步、trash/versions 自動清理、Cloudflare Access 一鍵設定
+- Phase 1:Streamable HTTP MCP + 沙箱化 CRUD + 寫入鎖與 revision 衝突檢查 + git 版本歷史（shadow repo）+ Access JWT 驗證（可選）+ 互動式一鍵部署(Linux / WSL)
+- Phase 2:編輯器擴充套件雙向同步、shadow.git gc、Access 設定自動化、Managed OAuth 驗證結果落地
