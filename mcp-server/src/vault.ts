@@ -11,11 +11,24 @@ import { Sandbox } from './sandbox.js';
 const execFileAsync = promisify(execFile);
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
-export function sha256(s: string): string {
-  return createHash('sha256').update(s, 'utf8').digest('hex');
+export type Encoding = 'utf8' | 'base64';
+
+export function sha256(s: string | Buffer): string {
+  return createHash('sha256').update(typeof s === 'string' ? Buffer.from(s, 'utf8') : s).digest('hex');
 }
 
-export const revisionOf = (content: string): string => sha256(content).slice(0, 16);
+/** Hash of the file's bytes; for UTF-8 text this equals the hash of the string, so text revisions are unchanged. */
+export const revisionOf = (content: string | Buffer): string => sha256(content).slice(0, 16);
+
+/** Text only if the bytes survive a UTF-8 round trip and contain no NUL; everything else goes over the wire as base64. */
+export function encodingOf(bytes: Buffer): Encoding {
+  if (bytes.includes(0)) return 'base64';
+  return Buffer.from(bytes.toString('utf8'), 'utf8').equals(bytes) ? 'utf8' : 'base64';
+}
+
+// Highest-precedence attributes for the shadow repo, so a .gitattributes in the vault
+// cannot make git EOL-normalize, filter (e.g. LFS) or re-encode what it stores.
+const SHADOW_ATTRIBUTES = '* -text -filter -ident -working-tree-encoding\n';
 
 class Mutex {
   private tail: Promise<unknown> = Promise.resolve();
@@ -49,6 +62,8 @@ export class Vault {
     }
     this.gitDir = path.join(dataReal, 'shadow.git');
     if (!fsSync.existsSync(path.join(this.gitDir, 'HEAD'))) this.initShadow();
+    fsSync.mkdirSync(path.join(this.gitDir, 'info'), { recursive: true });
+    fsSync.writeFileSync(path.join(this.gitDir, 'info', 'attributes'), SHADOW_ATTRIBUTES);
   }
 
   private gitEnv(): NodeJS.ProcessEnv {
@@ -71,6 +86,16 @@ export class Vault {
       cwd: this.root,
       env: this.gitEnv(),
       maxBuffer: GIT_MAX_BUFFER,
+    });
+    return stdout;
+  }
+
+  private async gitBytes(args: string[]): Promise<Buffer> {
+    const { stdout } = await execFileAsync('git', [...this.identityArgs('mcp'), ...args], {
+      cwd: this.root,
+      env: this.gitEnv(),
+      maxBuffer: GIT_MAX_BUFFER,
+      encoding: 'buffer',
     });
     return stdout;
   }
@@ -102,13 +127,14 @@ export class Vault {
     await this.git(['commit', '--quiet', '--only', '-m', `${subject}\n\nClient: ${actor}`, '--', relPath], actor);
   }
 
-  async read(rel: string): Promise<{ content: string; revision: string; mtime: string }> {
+  async read(rel: string): Promise<{ content: string; encoding: Encoding; revision: string; mtime: string }> {
     return this.lock.run(async () => {
       const abs = this.sandbox.resolve(rel);
       const stat = await fs.stat(abs).catch(() => null);
       if (!stat?.isFile()) throw new Error(`File not found: ${rel}`);
-      const content = await fs.readFile(abs, 'utf8');
-      return { content, revision: revisionOf(content), mtime: stat.mtime.toISOString() };
+      const bytes = await fs.readFile(abs);
+      const encoding = encodingOf(bytes);
+      return { content: bytes.toString(encoding), encoding, revision: revisionOf(bytes), mtime: stat.mtime.toISOString() };
     });
   }
 
@@ -130,11 +156,18 @@ export class Vault {
     return out.sort();
   }
 
-  async write(rel: string, content: string, actor: string, expectedRevision?: string): Promise<{ revision: string; created: boolean }> {
+  async write(
+    rel: string,
+    content: string | Buffer,
+    actor: string,
+    expectedRevision?: string,
+    encoding: Encoding = 'utf8',
+  ): Promise<{ revision: string; created: boolean }> {
+    const bytes = typeof content === 'string' ? Buffer.from(content, encoding) : content;
     return this.lock.run(async () => {
       const abs = this.sandbox.resolve(rel);
       const relPath = this.sandbox.toRelative(abs);
-      const prev = await fs.readFile(abs, 'utf8').catch(() => null);
+      const prev = await fs.readFile(abs).catch(() => null);
       if (prev === null && expectedRevision !== undefined) {
         throw new Error(`File does not exist: ${rel}. Omit expected_revision when creating a file.`);
       }
@@ -147,11 +180,11 @@ export class Vault {
           throw new Error(`Revision conflict: expected ${expectedRevision}, current is ${current}. Re-read the file and merge your changes.`);
         }
       }
-      const revision = revisionOf(content);
-      if (prev === content) return { revision, created: false };
+      const revision = revisionOf(bytes);
+      if (prev?.equals(bytes)) return { revision, created: false };
       if (prev !== null) await this.ensureBaseline(relPath, actor);
       await fs.mkdir(path.dirname(abs), { recursive: true });
-      await fs.writeFile(abs, content, 'utf8');
+      await fs.writeFile(abs, bytes);
       await this.commitPath(relPath, `${prev === null ? 'create' : 'write'} ${relPath}`, actor);
       return { revision, created: prev === null };
     });
@@ -180,7 +213,7 @@ export class Vault {
       });
       const out: { commit: string; date: string; subject: string; revision: string | null }[] = [];
       for (const row of rows) {
-        const content = await this.git(['show', `${row.commit}:${relPath}`]).catch(() => null);
+        const content = await this.gitBytes(['show', `${row.commit}:${relPath}`]).catch(() => null);
         out.push({ ...row, revision: content === null ? null : revisionOf(content) });
       }
       return out;
@@ -190,7 +223,7 @@ export class Vault {
   async restore(rel: string, commit: string, actor: string, expectedRevision?: string): Promise<{ revision: string; created: boolean }> {
     if (!/^[0-9a-f]{7,40}$/.test(commit)) throw new Error('Invalid version id');
     const relPath = this.relOf(rel);
-    const content = await this.git(['show', `${commit}:${relPath}`]).catch(() => {
+    const content = await this.gitBytes(['show', `${commit}:${relPath}`]).catch(() => {
       throw new Error(`Version not found: ${commit}`);
     });
     return this.write(rel, content, actor, expectedRevision);
@@ -212,19 +245,24 @@ export function registerVaultTools(server: McpServer, vault: Vault, actor: strin
 
   server.registerTool('read_file', {
     title: 'Read file',
-    description: 'Read a file from the mind library. Returns content and a revision hash.',
+    description: 'Read a file from the mind library. Returns content and a revision hash. Binary files (images, PDFs) are returned as base64 with "Encoding: base64".',
     inputSchema: { path: p },
   }, async ({ path: rel }) => {
     const r = await vault.read(rel);
-    return { content: [{ type: 'text', text: `Revision: ${r.revision}\n\n${r.content}` }] };
+    return { content: [{ type: 'text', text: `Revision: ${r.revision}\nEncoding: ${r.encoding}\n\n${r.content}` }] };
   });
 
   server.registerTool('write_file', {
     title: 'Write file',
-    description: 'Create a file, or overwrite an existing one. Overwriting REQUIRES expected_revision from read_file; a stale revision fails with a conflict.',
-    inputSchema: { path: p, content: z.string().describe('Full file content'), expected_revision: expectedRevision },
-  }, async ({ path: rel, content, expected_revision }) => {
-    const r = await vault.write(rel, content, actor, expected_revision);
+    description: 'Create a file, or overwrite an existing one. Overwriting REQUIRES expected_revision from read_file; a stale revision fails with a conflict. Pass encoding "base64" to write binary content.',
+    inputSchema: {
+      path: p,
+      content: z.string().describe('Full file content'),
+      expected_revision: expectedRevision,
+      encoding: z.enum(['utf8', 'base64']).optional().describe('How content is encoded; defaults to utf8'),
+    },
+  }, async ({ path: rel, content, expected_revision, encoding }) => {
+    const r = await vault.write(rel, content, actor, expected_revision, encoding);
     return { content: [{ type: 'text', text: JSON.stringify({ ok: true, ...r }) }] };
   });
 
