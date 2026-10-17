@@ -1,6 +1,6 @@
 # claude-mcp-server
 自用
-Claude MCP Server for **Mind Library Sync** — 讓 AI 與你的編輯器共用同一個思維庫(vault):AI 可建立、調用、編輯、刪除、整理文件,並透過 Cloudflare Tunnel 在網頁端與桌面 client 皆可用。原生 Linux 與 **WSL** 皆可部署。
+Claude MCP Server for **Mind Library Sync** — 讓 AI 與你的編輯器共用同一個思維庫(vault):AI 可建立、調用、編輯、刪除、整理文件,並透過 Cloudflare Tunnel 在網頁端與桌面 client 皆可用。原生 Linux、**WSL** 與 **Windows 原生**皆可部署。
 
 ## 架構(Phase 1)
 
@@ -74,6 +74,53 @@ sudo bash install.sh
 Cloudflare Tunnel 在 WSL 上完全沒問題:tunnel 是**向外**建立的連線,不需要開任何 inbound 埠。
 
 vault 若放在 `/mnt/c/...`(Windows 看得到)也可用,但存取效能比放在 Linux 檔案系統內慢。
+
+## 在 Windows 原生部署(不經 WSL)
+
+`install.sh` 只支援 Linux / WSL;Windows 上可以直接用 Node 跑伺服器,cloudflared 裝成 Windows 服務。
+
+1. **Cloudflare 後台**:在 [Zero Trust](https://one.dash.cloudflare.com) → Networks → Tunnels 建立 tunnel,Public Hostname 設成你的網域(例如 `mcp.example.com`)→ `HTTP` `localhost:3000`。在 Install connector 畫面複製 token。
+
+2. **安裝 cloudflared 服務**(系統管理員 PowerShell):
+
+   ```powershell
+   winget install --id Cloudflare.cloudflared
+   cloudflared.exe service install <你的 tunnel token>
+   sc query cloudflared   # 應為 RUNNING
+   ```
+
+   服務會開機自啟。後端還沒啟動時,公開網址回 502 是正常的。
+
+3. **設定與建置伺服器**:在 `mcp-server\` 建立 `.env`(已被 `.gitignore` 排除):
+
+   ```ini
+   VAULT_DIR=C:/Users/<你>/mind-vault
+   DATA_DIR=C:/Users/<你>/mind-vault-data
+   JWT_SECRET=<一串長亂數>
+   AUTH_PASSWORD=<閘門密碼>
+   PUBLIC_URL=https://mcp.example.com
+   HOST=127.0.0.1
+   PORT=3000
+   ```
+
+   `DATA_DIR` 不要放在 `VAULT_DIR` 裡面。產生亂數可用 `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`。
+
+   ```powershell
+   cd mcp-server
+   npm install
+   npm run build
+   node --env-file=.env dist/index.js
+   ```
+
+4. **驗證**(從任何能上網的機器):
+
+   ```powershell
+   curl.exe https://mcp.example.com/health                                 # 200 {"ok":true,...}
+   curl.exe https://mcp.example.com/.well-known/oauth-authorization-server # 200 metadata
+   curl.exe -s -o NUL -w "%{http_code}" -X POST https://mcp.example.com/mcp -H "content-type: application/json" -d "{}"   # 401
+   ```
+
+5. **開機自動啟動**:上面的 `node` 是前景程序,登出或重開機就會停,公開網址會變回 502。要常駐可用「工作排程器」建立登入/開機時執行 `node --env-file=.env dist\index.js`(起始位置設成 `mcp-server` 資料夾),或用 NSSM 包成 Windows 服務。
 
 ## 連接 client
 
