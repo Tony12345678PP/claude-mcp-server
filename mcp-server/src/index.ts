@@ -67,6 +67,9 @@ const newServer = (actor: string): McpServer => {
 };
 
 const app = express();
+// cloudflared is the only hop in front of us; take the client IP it forwards
+// so per-IP rate limits apply to visitors, not to 127.0.0.1.
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '25mb' }));
 
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'mind-library-mcp' }));

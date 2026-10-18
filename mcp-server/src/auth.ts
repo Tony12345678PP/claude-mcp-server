@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { SignJWT, jwtVerify } from 'jose';
+import { rateLimit } from 'express-rate-limit';
 
 /**
  * Single-user OAuth 2.0 authorization server (public clients, PKCE S256):
@@ -23,6 +24,9 @@ const CLIENTS_FILE = path.join(DATA_DIR, 'clients.json');
 const ACCESS_TTL = 15 * 60; // seconds
 const REFRESH_TTL_MS = 30 * 24 * 3600 * 1000;
 const MAX_CLIENTS = 50;
+const GATE_WINDOW_MS = 15 * 60 * 1000;
+const GATE_MAX_FAILURES = 10; // per client IP per window
+const RESOURCE_METADATA_URL = `${BASE_URL}/.well-known/oauth-protected-resource`;
 
 if (!PASSWORD || !process.env.JWT_SECRET) {
   console.error('FATAL: AUTH_PASSWORD and JWT_SECRET must be set. Aborting.');
@@ -30,6 +34,13 @@ if (!PASSWORD || !process.env.JWT_SECRET) {
 }
 
 const sha256hex = (s: string) => crypto.createHash('sha256').update(s, 'utf8').digest('hex');
+
+// Hash both sides first so timingSafeEqual sees equal-length inputs and the
+// comparison time does not depend on how much of the password matched.
+const PASSWORD_DIGEST = crypto.createHash('sha256').update(PASSWORD, 'utf8').digest();
+const passwordMatches = (candidate: unknown): boolean =>
+  typeof candidate === 'string' &&
+  crypto.timingSafeEqual(crypto.createHash('sha256').update(candidate, 'utf8').digest(), PASSWORD_DIGEST);
 
 type RefreshRecord = { hash: string; created: number; sub: string };
 const loadRefresh = (): RefreshRecord[] => {
@@ -159,11 +170,24 @@ authRouter.get('/authorize', (req, res) => {
   res.type('html').send(passwordPage(q));
 });
 
-authRouter.post('/authorize', express.urlencoded({ extended: false }), (req, res) => {
+// Only failed attempts count, keyed by client IP (req.ip honours the app's
+// 'trust proxy' setting, so behind cloudflared it is the real visitor IP).
+const gateLimiter = rateLimit({
+  windowMs: GATE_WINDOW_MS,
+  limit: GATE_MAX_FAILURES,
+  skipSuccessfulRequests: true,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  handler: (_req, res) => {
+    res.status(429).type('text').send('Too many failed attempts. Try again later.');
+  },
+});
+
+authRouter.post('/authorize', gateLimiter, express.urlencoded({ extended: false }), (req, res) => {
   const body = req.body as Record<string, string>;
   const err = authorizeError(body);
   if (err) return res.status(400).send(err);
-  if (body.password !== PASSWORD) {
+  if (!passwordMatches(body.password)) {
     const params = new URLSearchParams(Object.entries(body).filter(([k]) => k !== 'password'));
     return res.status(401).type('html').send(passwordPage(params));
   }
@@ -215,14 +239,23 @@ authRouter.post('/revoke', express.urlencoded({ extended: false }), (req, res) =
   return res.json({ ok: true });
 });
 
+// MCP authorization spec / RFC 9728: a 401 must point the client at the
+// protected resource metadata so it can discover the authorization server.
+const challenge = (error?: string) =>
+  `Bearer resource_metadata="${RESOURCE_METADATA_URL}"` + (error ? `, error="${error}"` : '');
+
 export const requireAuth = async (req: Request, res: Response, next: NextFunction) => {
   const h = req.headers.authorization ?? '';
   const token = h.startsWith('Bearer ') ? h.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'unauthorized', hint: 'GET /.well-known/oauth-authorization-server for metadata' });
+  if (!token) {
+    res.set('WWW-Authenticate', challenge());
+    return res.status(401).json({ error: 'unauthorized', hint: 'GET /.well-known/oauth-protected-resource for metadata' });
+  }
   try {
     await jwtVerify(token, SECRET, { issuer: BASE_URL, audience: 'mcp-client' });
     next();
   } catch {
+    res.set('WWW-Authenticate', challenge('invalid_token'));
     return res.status(401).json({ error: 'invalid_token' });
   }
 };

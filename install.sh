@@ -22,15 +22,29 @@ warn()  { printf "${C_Y}  [!]${C_0} %s\n" "$1"; }
 fail()  { printf "${C_R}  [✗] %s${C_0}\n" "$1" >&2; exit 1; }
 ask()   { printf "${C_Y}  ▶ %s${C_0}" "$1"; }
 
+# cloudflared release 檔名用 amd64 / arm64 / arm / 386,dpkg 與 uname -m 的命名不同,要先換算
+cloudflared_arch() {
+  local m
+  m="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  case "$m" in
+    amd64|x86_64)        echo amd64 ;;
+    arm64|aarch64)       echo arm64 ;;
+    armhf|armv7l|armv7*) echo armhf ;;
+    armel|armv6l|arm)    echo arm ;;
+    i386|i686|386)       echo 386 ;;
+    *) return 1 ;;
+  esac
+}
+
 banner() {
-printf '${C_B}'
+printf '%b' "$C_B"
 cat <<'EOF'
 ==============================================
    Mind Library MCP Server — 一鍵安裝
    Editor ↔ AI 思維庫同步伺服器
 ==============================================
 EOF
-printf '${C_0}'
+printf '%b' "$C_0"
 }
 
 banner
@@ -65,7 +79,7 @@ if [[ $IS_WSL -eq 1 && ! -d /run/systemd/system ]]; then
       else
         sed -i '/^\[boot\]/a systemd=true' /etc/wsl.conf
       fi
-      printf '${C_Y}'
+      printf '%b' "$C_Y"
       cat <<'EOF'
   [!] 已在 /etc/wsl.conf 啟用 systemd。
       現在請做這一件事(只需要一次):
@@ -75,7 +89,7 @@ if [[ $IS_WSL -eq 1 && ! -d /run/systemd/system ]]; then
         4. 重新執行:  sudo bash install.sh
       (原本的進度都會保留,不會重裝)
 EOF
-      printf '${C_0}'
+      printf '%b' "$C_0"
       exit 0
     elif [[ "$REPLY" == "2" ]]; then
       RUNTIME="wsl-nosystemd"
@@ -246,18 +260,26 @@ fi
 
 if [[ -n "$TUNNEL_TOKEN" ]] && ! command -v cloudflared >/dev/null; then
   info "下載 cloudflared..."
-  ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  ARCH="$(cloudflared_arch)" || fail "不支援的 CPU 架構:$(uname -m)。請手動安裝 cloudflared 後重跑本腳本。"
   curl -fsSL -o /usr/local/bin/cloudflared "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$ARCH"
   chmod +x /usr/local/bin/cloudflared
   log "cloudflared 安裝完成。"
 fi
-# 把 token 存進只有 root 可讀的檔案,重跑腳本不用再貼一次
-if [[ -n "$TUNNEL_TOKEN" ]]; then
-  printf '%s' "$TUNNEL_TOKEN" > /etc/mcp-vault.tunnel-token
-  chmod 600 /etc/mcp-vault.tunnel-token
+# 把 token 存進只有 root 可讀的環境變數檔,重跑腳本不用再貼一次。
+# cloudflared 從 TUNNEL_TOKEN 環境變數讀 token,所以 token 不會出現在
+# 程序參數(ps、/proc/*/cmdline)或 systemd unit 檔裡。
+TUNNEL_ENV_FILE="/etc/mcp-vault.tunnel.env"
+LEGACY_TOKEN_FILE="/etc/mcp-vault.tunnel-token"
+if [[ -z "$TUNNEL_TOKEN" && ! -f "$TUNNEL_ENV_FILE" && -f "$LEGACY_TOKEN_FILE" ]]; then
+  TUNNEL_TOKEN="$(cat "$LEGACY_TOKEN_FILE")"
 fi
+if [[ -n "$TUNNEL_TOKEN" ]]; then
+  (umask 077; printf 'TUNNEL_TOKEN=%s\n' "$TUNNEL_TOKEN" > "$TUNNEL_ENV_FILE")
+  chmod 600 "$TUNNEL_ENV_FILE"
+fi
+rm -f "$LEGACY_TOKEN_FILE"
 TUNNEL_TOKEN_FILE=""
-[[ -f /etc/mcp-vault.tunnel-token ]] && TUNNEL_TOKEN_FILE="/etc/mcp-vault.tunnel-token"
+[[ -f "$TUNNEL_ENV_FILE" ]] && TUNNEL_TOKEN_FILE="$TUNNEL_ENV_FILE"
 
 # ---------- 5b. 依執行模式啟動服務 ----------
 if [[ "$RUNTIME" == "systemd" ]]; then
@@ -289,7 +311,8 @@ Description=cloudflared tunnel for mind-library MCP
 After=network-online.target mcp-vault.service
 
 [Service]
-ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run --token $(cat $TUNNEL_TOKEN_FILE)
+EnvironmentFile=$TUNNEL_TOKEN_FILE
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate run
 Restart=always
 RestartSec=10
 
@@ -306,6 +329,7 @@ EOF
   fi
 else
   # WSL 無 systemd:提供 ctl 腳本 + nohup 背景程序
+  # 設定值在安裝時寫進檔頭;本體用 quoted heredoc,變數到執行時才展開
   cat > /usr/local/bin/mcp-vault-ctl <<EOF
 #!/usr/bin/env bash
 # WSL 模式服務管理:start / stop / restart / status
@@ -314,19 +338,22 @@ ENV_FILE="$ENV_FILE"
 INSTALL_DIR="$INSTALL_DIR"
 LOG_DIR="/var/log/mcp-vault"
 TOKEN_FILE="$TUNNEL_TOKEN_FILE"
+EOF
+  cat >> /usr/local/bin/mcp-vault-ctl <<'EOF'
 
 is_up()  { pgrep -f 'dist/index.js' >/dev/null; }
 cf_up()  { pgrep -f 'cloudflared tunnel' >/dev/null; }
 
 start() {
   if is_up; then echo "[✓] mcp-vault 已在執行中"; else
+    # 密碼與 JWT 金鑰以環境變數傳遞,不放進程序參數;setpriv 直接 exec,不留帶參數的父程序
     mapfile -t ENV_KV < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' "$ENV_FILE")
-    nohup sudo -u mcp-vault env "${ENV_KV[@]}" node $INSTALL_DIR/dist/index.js >> $LOG_DIR/server.log 2>&1 &
+    ( export "${ENV_KV[@]}"; exec nohup setpriv --reuid=mcp-vault --regid=mcp-vault --init-groups node $INSTALL_DIR/dist/index.js >> $LOG_DIR/server.log 2>&1 ) &
     sleep 1
     is_up && echo "[✓] mcp-vault 已啟動(log: $LOG_DIR/server.log)" || { echo "[✗] 啟動失敗,看 log: tail -50 $LOG_DIR/server.log"; exit 1; }
   fi
   if [[ -n "$TOKEN_FILE" ]] && ! cf_up; then
-    nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run --token "$(cat $TOKEN_FILE)" >> $LOG_DIR/cloudflared.log 2>&1 &
+    TUNNEL_TOKEN="$(sed -n 's/^TUNNEL_TOKEN=//p' "$TOKEN_FILE")" nohup /usr/local/bin/cloudflared tunnel --no-autoupdate run >> $LOG_DIR/cloudflared.log 2>&1 &
     sleep 2
     cf_up && echo "[✓] cloudflared 已啟動(log: $LOG_DIR/cloudflared.log)" || echo "[!] cloudflared 似乎沒起來,看 log: tail -50 $LOG_DIR/cloudflared.log"
   fi
@@ -383,9 +410,11 @@ else
 fi
 
 printf '\n'
-printf '${C_G}==============================================\n'
+printf '%b' "$C_G"
+printf '==============================================\n'
 printf '   安裝完成!\n'
-printf '==============================================\n${C_0}'
+printf '==============================================\n'
+printf '%b' "$C_0"
 info "你的 MCP 網址: ${PUBLIC_URL:-<設定 tunnel 後會是 https://mcp.你的網域>/mcp}"
 info ""
 info "之後在 Claude / client 的 MCP 設定貼上:"

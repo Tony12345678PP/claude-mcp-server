@@ -12,11 +12,13 @@ process.env.JWT_SECRET = 'test-secret';
 process.env.DATA_DIR = dataDir;
 process.env.PUBLIC_URL = 'http://127.0.0.1';
 
-const { authRouter } = await import('../dist/auth.js');
+const { authRouter, requireAuth } = await import('../dist/auth.js');
 const express = (await import('express')).default;
 
 const app = express();
+app.set('trust proxy', 1);
 app.use('/', authRouter);
+app.post('/mcp', requireAuth, (_req, res) => res.json({ ok: true }));
 
 let server;
 let base;
@@ -200,4 +202,69 @@ test('refresh token is single use', async () => {
   assert.equal(ok.status, 200);
   const replay = await exchange({ grant_type: 'refresh_token', refresh_token: first.refresh_token });
   assert.equal(replay.status, 400);
+});
+
+const RESOURCE_METADATA = 'Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource"';
+
+test('401 without a token carries WWW-Authenticate pointing at the resource metadata', async () => {
+  const res = await fetch(`${base}/mcp`, { method: 'POST' });
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get('www-authenticate'), RESOURCE_METADATA);
+});
+
+test('401 for a bad token carries WWW-Authenticate with error="invalid_token"', async () => {
+  const res = await fetch(`${base}/mcp`, { method: 'POST', headers: { authorization: 'Bearer not-a-jwt' } });
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get('www-authenticate'), `${RESOURCE_METADATA}, error="invalid_token"`);
+});
+
+test('a valid access token passes requireAuth', async () => {
+  const { client_id, verifier, code } = await issueCode();
+  const { access_token } = await (await exchange({ grant_type: 'authorization_code', code, code_verifier: verifier, redirect_uri: CLAUDE_CB, client_id })).json();
+  const res = await fetch(`${base}/mcp`, { method: 'POST', headers: { authorization: `Bearer ${access_token}` } });
+  assert.equal(res.status, 200);
+});
+
+test('protected resource metadata names this server as the authorization server', async () => {
+  const meta = await (await fetch(`${base}/.well-known/oauth-protected-resource`)).json();
+  assert.deepEqual(meta.authorization_servers, ['http://127.0.0.1']);
+});
+
+const fromIp = (ip, params) => {
+  const opts = form(params);
+  opts.headers = { ...opts.headers, 'x-forwarded-for': ip };
+  return fetch(`${base}/authorize`, opts);
+};
+
+test('password gate locks an IP out after 10 failures, even for the right password', async () => {
+  const client_id = await registerClient();
+  const { challenge } = newPkce();
+  const good = authorizeParams(client_id, challenge);
+  for (let i = 0; i < 10; i++) {
+    assert.equal((await fromIp('203.0.113.7', { ...good, password: `wrong-${i}` })).status, 401);
+  }
+  const locked = await fromIp('203.0.113.7', good);
+  assert.equal(locked.status, 429);
+  assert.ok(locked.headers.get('ratelimit-policy'));
+});
+
+test('password gate limit is per IP and successful logins do not count', async () => {
+  const client_id = await registerClient();
+  const { challenge } = newPkce();
+  const good = authorizeParams(client_id, challenge);
+  for (let i = 0; i < 12; i++) {
+    assert.equal((await fromIp('198.51.100.9', good)).status, 302);
+  }
+  assert.equal((await fromIp('198.51.100.9', { ...good, password: 'wrong' })).status, 401);
+});
+
+test('password comparison rejects prefixes, extensions and a missing field', async () => {
+  const client_id = await registerClient();
+  const { challenge } = newPkce();
+  const good = authorizeParams(client_id, challenge);
+  for (const password of ['p', 'pww', 'PW', '']) {
+    assert.equal((await fromIp('192.0.2.50', { ...good, password })).status, 401);
+  }
+  const { password: _omit, ...noPassword } = good;
+  assert.equal((await fromIp('192.0.2.50', noPassword)).status, 401);
 });
