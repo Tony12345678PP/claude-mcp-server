@@ -129,3 +129,79 @@ test('lists files without exposing .git, and lists the root with no argument', a
   await vault.write('a/b.md', 'x', ACTOR);
   assert.deepEqual(await vault.list(''), ['a/b.md']);
 });
+
+// Minimal but realistic binary fixtures: bytes that are invalid UTF-8, NULs, CR/LF pairs and a high-bit run.
+const PNG = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  Buffer.from('0000000d49484452000000010000000108060000001f15c489', 'hex'),
+  Buffer.from('0000000d4944415478da63f8cfc0f01f0005000201a2f5e2b30000000049454e44ae426082', 'hex'),
+  Buffer.from(Array.from({ length: 256 }, (_, i) => i)),
+]);
+const PDF = Buffer.concat([
+  Buffer.from('%PDF-1.7\r\n%'),
+  Buffer.from([0xe2, 0xe3, 0xcf, 0xd3]),
+  Buffer.from('\r\n1 0 obj\r\n<< /Length 6 /Filter /FlateDecode >>\r\nstream\r\n'),
+  Buffer.from([0x78, 0x9c, 0x00, 0xff, 0xfe, 0x80]),
+  Buffer.from('\r\nendstream\r\nendobj\r\n%%EOF\n'),
+]);
+const FIXTURES = [['image.png', PNG], ['doc.pdf', PDF]];
+
+const decode = (r) => Buffer.from(r.content, r.encoding === 'base64' ? 'base64' : 'utf8');
+const shadowBlob = (base, rel) =>
+  execFileSync('git', ['--git-dir', path.join(base, 'data', 'shadow.git'), 'show', `HEAD:${rel}`]);
+
+for (const [name, bytes] of FIXTURES) {
+  test(`${name}: a file already in the vault reads back byte-exact and its baseline restores byte-exact`, async (t) => {
+    const { base, root, vault } = makeVault(t);
+    fs.mkdirSync(path.join(root, 'att'));
+    fs.writeFileSync(path.join(root, 'att', name), bytes);
+    const r = await vault.read(`att/${name}`);
+    assert.equal(r.encoding, 'base64');
+    assert.ok(decode(r).equals(bytes), 'read returns the exact bytes');
+    assert.equal(r.revision, revisionOf(bytes));
+
+    const { revision } = await vault.write(`att/${name}`, 'replaced', ACTOR, r.revision);
+    assert.ok(shadowBlob(base, `att/${name}`).equals(Buffer.from('replaced')));
+    const baseline = (await vault.versions(`att/${name}`)).find(v => v.revision === r.revision);
+    assert.ok(baseline, 'baseline version keeps the binary revision');
+    await vault.restore(`att/${name}`, baseline.commit, ACTOR, revision);
+    assert.ok(fs.readFileSync(path.join(root, 'att', name)).equals(bytes), 'restored bytes on disk');
+    assert.ok(shadowBlob(base, `att/${name}`).equals(bytes), 'restored bytes in shadow git');
+  });
+
+  test(`${name}: written as base64, deleted and restored without losing a byte`, async (t) => {
+    const { base, root, vault } = makeVault(t);
+    const created = await vault.write(name, bytes.toString('base64'), ACTOR, undefined, 'base64');
+    assert.equal(created.revision, revisionOf(bytes));
+    assert.ok(fs.readFileSync(path.join(root, name)).equals(bytes), 'written bytes on disk');
+    assert.ok(shadowBlob(base, name).equals(bytes), 'committed bytes in shadow git');
+    assert.ok(decode(await vault.read(name)).equals(bytes), 'read back');
+
+    await vault.del(name, ACTOR);
+    const before = (await vault.versions(name)).find(v => v.revision === created.revision);
+    assert.ok(before, 'pre-delete version is recorded');
+    await vault.restore(name, before.commit, ACTOR);
+    assert.ok(fs.readFileSync(path.join(root, name)).equals(bytes), 'restored bytes on disk');
+  });
+
+  test(`${name}: a vault .gitattributes cannot make the shadow repo rewrite the bytes`, async (t) => {
+    const { base, root, vault } = makeVault(t);
+    fs.writeFileSync(path.join(root, '.gitattributes'), '* text=auto eol=lf\n*.png text\n*.pdf text\n');
+    const created = await vault.write(name, bytes.toString('base64'), ACTOR, undefined, 'base64');
+    assert.ok(shadowBlob(base, name).equals(bytes), 'blob is not EOL-normalized');
+    await vault.del(name, ACTOR);
+    const before = (await vault.versions(name)).find(v => v.revision === created.revision);
+    await vault.restore(name, before.commit, ACTOR);
+    assert.ok(fs.readFileSync(path.join(root, name)).equals(bytes), 'restored bytes on disk');
+  });
+}
+
+test('UTF-8 text keeps the same revision and is returned as text', async (t) => {
+  const { vault } = makeVault(t);
+  const text = '中文筆記\r\nline two\n';
+  const { revision } = await vault.write('note.md', text, ACTOR);
+  assert.equal(revision, revisionOf(text));
+  const r = await vault.read('note.md');
+  assert.equal(r.encoding, 'utf8');
+  assert.equal(r.content, text);
+});
